@@ -13,9 +13,9 @@
         "blacklist": ["ETH/USDT:USDT","ETH/USDT:USDT"]
     },
     "okx": {
-        "apiKey": "",
-        "secret": "",
-        "password": "",
+        "apiKey": "6b6b13c6-ea0e-4bd3-a16a-08655a592cea",
+        "secret": "BA95AE7A8BE706B4F2D15F8D7F69389E",
+        "password": "mt@1qaz!QAZ",
         "leverage": 1.0,
         "stop_loss_pct": 2,
         "low_trail_stop_loss_pct": 0.2,

@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-import ccxt
 import time
 import logging
 import requests
 import json
-import okx.Trade_api as TradeAPI
+import okx.Trade as TradeAPI
+import okx.Account as AccountAPI
+import okx.PublicData as PublicDataAPI
 from logging.handlers import TimedRotatingFileHandler
 
 class MultiAssetTradingBot:
@@ -22,18 +23,17 @@ class MultiAssetTradingBot:
         self.monitor_interval = monitor_interval  # 从配置文件读取的监控循环时间
 
 
-        # 配置交易所
-        self.exchange = ccxt.okx({
-            'apiKey': config["apiKey"],
-            'secret': config["secret"],
-            'password': config["password"],
-            'timeout': 3000,
-            'rateLimit': 50,
-            'options': {'defaultType': 'future'},
-            # 'proxies': {'http': 'http://127.0.0.1:10100', 'https': 'http://127.0.0.1:10100'},
-        })
-        # 配置 OKX 第三方库
-        self.trading_bot = TradeAPI.TradeAPI(config["apiKey"], config["secret"], config["password"], False, '0')
+        # 配置 OKX 官方 SDK
+        # flag: '0' 表示实盘交易，'1' 表示模拟交易
+        self.flag = '0'  # 实盘交易
+        self.api_key = config["apiKey"]
+        self.secret_key = config["secret"]
+        self.passphrase = config["password"]
+        
+        # 初始化各个API模块
+        self.trade_api = TradeAPI.TradeAPI(self.api_key, self.secret_key, self.passphrase, False, self.flag)
+        self.account_api = AccountAPI.AccountAPI(self.api_key, self.secret_key, self.passphrase, False, self.flag)
+        self.public_api = PublicDataAPI.PublicAPI(flag=self.flag)
         # 配置日志
         log_file = "log/okx.log"
         logger = logging.getLogger(__name__)
@@ -59,22 +59,59 @@ class MultiAssetTradingBot:
         # 获取持仓模式
         self.position_mode = self.get_position_mode()
 
+    def convert_inst_id_to_symbol(self, inst_id):
+        """将OKX的instId转换为ccxt格式的symbol"""
+        try:
+            # 例如: BTC-USDT-SWAP -> BTC/USDT:USDT
+            if '-SWAP' in inst_id:
+                base_quote = inst_id.replace('-SWAP', '')
+                parts = base_quote.split('-')
+                if len(parts) == 2:
+                    return f"{parts[0]}/{parts[1]}:{parts[1]}"
+            # 例如: BTC-USDT -> BTC/USDT
+            elif '-' in inst_id and 'SWAP' not in inst_id:
+                parts = inst_id.split('-')
+                if len(parts) == 2:
+                    return f"{parts[0]}/{parts[1]}"
+            return inst_id  # 如果无法转换，返回原值
+        except Exception as e:
+            self.logger.error(f"转换instId失败: {e}")
+            return inst_id
+
+    def convert_symbol_to_inst_id(self, symbol):
+        """将ccxt格式的symbol转换为OKX的instId"""
+        try:
+            # 例如: BTC/USDT:USDT -> BTC-USDT-SWAP
+            if ':' in symbol:
+                base_part = symbol.split(':')[0]
+                return base_part.replace('/', '-') + '-SWAP'
+            # 例如: BTC/USDT -> BTC-USDT
+            else:
+                return symbol.replace('/', '-')
+        except Exception as e:
+            self.logger.error(f"转换symbol失败: {e}")
+            return symbol
+
     def get_position_mode(self):
         try:
-            # 假设该端点用于获取账户持仓模式
-            response = self.exchange.private_get_account_config()
-            data = response.get('data', [])
-            if data and isinstance(data, list):
-                # 取列表的第一个元素（假设它是一个字典），然后获取 'posMode'
-                position_mode = data[0].get('posMode', 'single')  # 默认值为单向
-                self.logger.info(f"当前持仓模式: {position_mode}")
-                return position_mode
+            # 使用OKX官方SDK获取账户配置
+            response = self.account_api.get_account_config()
+            if response['code'] == '0' and response.get('data'):
+                data = response['data']
+                if data and isinstance(data, list):
+                    # 取列表的第一个元素（假设它是一个字典），然后获取 'posMode'
+                    position_mode = data[0].get('posMode', 'single')  # 默认值为单向
+                    self.logger.info(f"当前持仓模式: {position_mode}")
+                    return position_mode
+                else:
+                    self.logger.error("无法检测持仓模式: 'data' 字段为空或格式不正确")
+                    return 'single'  # 返回默认值
             else:
-                self.logger.error("无法检测持仓模式: 'data' 字段为空或格式不正确")
-                return 'single'  # 返回默认值
+                self.logger.error(f"获取账户配置失败: {response}")
+                return 'single'
         except Exception as e:
             self.logger.error(f"无法检测持仓模式: {e}")
-            return None
+            return 'single'
 
     def send_feishu_notification(self, message):
         if self.feishu_webhook:
@@ -104,25 +141,49 @@ class MultiAssetTradingBot:
 
     def fetch_positions(self):
         try:
-            positions = self.exchange.fetch_positions()
-            return positions
+            # 使用OKX官方SDK获取持仓信息
+            response = self.account_api.get_positions()
+            if response['code'] == '0':
+                positions_data = response.get('data', [])
+                # 转换为与原来ccxt格式兼容的数据结构
+                positions = []
+                for pos in positions_data:
+                    if float(pos.get('pos', 0)) != 0:  # 只返回有持仓的数据
+                        position = {
+                            'symbol': self.convert_inst_id_to_symbol(pos['instId']),
+                            'contracts': pos['pos'],  # 持仓数量
+                            'entryPrice': pos['avgPx'],  # 开仓均价
+                            'markPrice': pos['markPx'],  # 标记价格
+                            'side': pos['posSide'],  # 持仓方向
+                            'marginMode': pos['mgnMode'],  # 保证金模式
+                            'instId': pos['instId'],  # 保留原始instId
+                            'lever': pos['lever']
+                        }
+                        positions.append(position)
+                return positions
+            else:
+                self.logger.error(f"获取持仓失败: {response}")
+                return []
         except Exception as e:
             self.logger.error(f"Error fetching positions: {e}")
             return []
 
     def close_position(self, symbol, amount, side, td_mode):
         try:
-            market_symbol = symbol.replace('/', '-').replace(':USDT', '-SWAP')
+            # 转换symbol为instId
+            inst_id = self.convert_symbol_to_inst_id(symbol)
 
             # 根据 position_mode 选择平仓方向
             if self.position_mode == 'long_short_mode':
                 # 在双向持仓模式下，确保指定平仓方向  posSide 指定方向
-                pos_side = 'long' if side == 'long' else 'short'
+                # 注意：side参数是从fetch_positions中获取的，已经正确表示了仓位方向
+                pos_side = side  # 直接使用传入的side值，它已经是'long'或'short'
             else:
                 # 在 net_mode 模式下，不区分方向，系统会自动平仓
                 pos_side = 'net'
 
-            order = self.trading_bot.close_positions(instId=market_symbol, mgnMode=td_mode, posSide=pos_side, autoCxl='true')
+            # 使用OKX官方SDK平仓
+            order = self.trade_api.close_positions(instId=inst_id, mgnMode=td_mode, posSide=pos_side, autoCxl='true')
 
             if order['code'] == '0':
                 self.logger.info(f"Closed position for {symbol} with size {amount}, side: {pos_side}")
@@ -157,6 +218,7 @@ class MultiAssetTradingBot:
             current_price = float(position['markPrice'])
             side = position['side']
             td_mode = position['marginMode']
+            lever = float(position['lever'])
 
             if position_amt == 0:
                 continue
@@ -185,11 +247,11 @@ class MultiAssetTradingBot:
                 self.logger.info(f"{symbol} 检测到加仓，重置最高盈利和档位。")
                 continue  # 跳出当前循环，进入下一个仓位检测
 
-            # 计算盈亏
+            # 计算盈亏（修正做多/做空方向逻辑并考虑杠杆倍数）
             if side == 'long':
-                profit_pct = (current_price - entry_price) / entry_price * 100
+                profit_pct = (current_price - entry_price) / entry_price * 100 * lever
             elif side == 'short':
-                profit_pct = (entry_price - current_price) / entry_price * 100
+                profit_pct = (entry_price - current_price) / entry_price * 100 * lever
             else:
                 continue
 
